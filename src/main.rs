@@ -1,14 +1,15 @@
 mod adpcm;
+mod sound;
 
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
-use swf::{AudioCompression, Tag, SoundStreamHead};
+use swf::Tag;
 
-use crate::adpcm::AdpcmDecoder;
+use crate::sound::Sound;
 
 
 #[derive(Parser)]
@@ -18,20 +19,19 @@ struct Opts {
 
 
 fn process_tags(filename_prefix: &str, tags: &[Tag]) {
-    let mut stream: Vec<u8> = Vec::new();
-    let mut stream_head: Option<Box<SoundStreamHead>> = None;
+    let mut stream_sound: Option<Sound> = None;
     for tag in tags {
         match tag {
             Tag::DefineSound(snd) => {
-                if let AudioCompression::Mp3 = snd.format.compression {
-                    let file_name = format!("{}{}.mp3", filename_prefix, snd.id);
-                    let mut mp3 = File::create(file_name)
-                        .expect("failed to open MP3 file");
-                    mp3.write_all(snd.data)
-                        .expect("failed to write MP3 file");
-                } else {
-                    println!("unexpected compression {:?}", snd.format.compression);
-                }
+                let sound = Sound {
+                    format: snd.format.clone(),
+                    data: Vec::from(snd.data),
+                };
+                let file_name = format!("{}{}.{}", filename_prefix, snd.id, sound.extension());
+                let output = File::create(file_name)
+                    .expect("failed to open sound file");
+                sound.write(output)
+                    .expect("failed to write sound file");
             },
             Tag::DefineBinaryData(bd) => {
                 let file_name = format!("{}{}.bin", filename_prefix, bd.id);
@@ -69,36 +69,21 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             Tag::SetBackgroundColor(_) => {},
             Tag::ShowFrame => {},
             Tag::SoundStreamBlock(ssb) => {
-                if let Some(sh) = &stream_head {
-                    match sh.stream_format.compression {
-                        AudioCompression::Mp3 => {
-                            // the data can be decoded by MP3 playback software
-                            stream.extend(*ssb);
-                        },
-                        AudioCompression::Adpcm => {
-                            // this needs decoding first
-                            let adpcm_reader = AdpcmDecoder::new(*ssb, sh.stream_format.is_stereo)
-                                .expect("failed to create ADPCM reader");
-                            for samples in adpcm_reader {
-                                stream.extend(samples[0].to_le_bytes());
-                                if sh.stream_format.is_stereo {
-                                    stream.extend(samples[1].to_le_bytes());
-                                }
-                            }
-                        },
-                        other => {
-                            panic!("cannot deal with {:?} sound stream compression", other);
-                        },
-                    }
+                if let Some(snd) = &mut stream_sound {
+                    snd.append_data(ssb);
                 }
             },
             Tag::SoundStreamHead(ssh) => {
-                println!("{}stream: {:?}", filename_prefix, ssh);
-                stream_head = Some(ssh.clone());
+                stream_sound = Some(Sound {
+                    format: ssh.stream_format.clone(),
+                    data: Vec::new(),
+                });
             },
             Tag::SoundStreamHead2(ssh) => {
-                println!("{}stream {:?}", filename_prefix, ssh);
-                stream_head = Some(ssh.clone());
+                stream_sound = Some(Sound {
+                    format: ssh.stream_format.clone(),
+                    data: Vec::new(),
+                });
             },
             Tag::StartSound(_) => {},
             other => {
@@ -106,90 +91,13 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             },
         }
     }
-    if stream.len() > 0 {
-        let compression = stream_head
-            .as_ref()
-            .map(|sh| sh.stream_format.compression);
-        match compression {
-            Some(AudioCompression::Mp3) => {
-                // output straight out as MP3
-                let file_name = format!("{}stream.mp3", filename_prefix);
-                let mut f = File::create(&file_name)
-                    .expect("failed to open stream file");
-                f.write_all(&stream)
-                    .expect("failed to write stream file");
-            },
-            Some(AudioCompression::Uncompressed)|Some(AudioCompression::Adpcm) => {
-                // we have reconstructed PCM from ADPCM, so treat them the same
-                // note: RIFF is little-endian
-                let stream_format = &stream_head.as_ref().unwrap().stream_format;
-                let sample_rate_bytes = u32::from(stream_format.sample_rate).to_le_bytes();
-                // sample rate * bytes per sample * channels
-                let bytes_per_sec_bytes = (
-                    u32::from(stream_format.sample_rate)
-                    * if stream_format.is_16_bit { 2 } else { 1 }
-                    * if stream_format.is_stereo { 2 } else { 1 }
-                ).to_le_bytes();
-                let sample_alignment_bytes = (
-                    1u16
-                    * if stream_format.is_16_bit { 2 } else { 1 }
-                    * if stream_format.is_stereo { 2 } else { 1 }
-                ).to_le_bytes();
-                let bits_per_sample_bytes = match stream_format.compression {
-                    AudioCompression::Uncompressed => {
-                        if stream_format.is_16_bit { 16u16 } else { 8 }
-                    },
-                    AudioCompression::Adpcm => 16, // always decodes to signed-16 PCM
-                    _ => unreachable!(),
-                }.to_le_bytes();
-
-                let fmt_data = [
-                    // general information
-                    0x01, 0x00, // format tag = PCM (0x0001)
-                    if stream_format.is_stereo { 0x02 } else { 0x01 }, 0x00, // channels = stereo (0x0002) or mono (0x0001)
-                    sample_rate_bytes[0], sample_rate_bytes[1], sample_rate_bytes[2], sample_rate_bytes[3], // sampling rate (u32)
-                    bytes_per_sec_bytes[0], bytes_per_sec_bytes[1], bytes_per_sec_bytes[2], bytes_per_sec_bytes[3], // (average) bytes per second (u32)
-                    sample_alignment_bytes[0], sample_alignment_bytes[1], // sample byte alignment (u16)
-
-                    // format-specific information (PCM)
-                    bits_per_sample_bytes[0], bits_per_sample_bytes[1], // bits per sample (u16)
-                ];
-
-                let riff_data_len =
-                    4 // "WAVE" type identifier
-                    + 4 // "fmt " chunk tag
-                    + 4 // "fmt " chunk length value
-                    + fmt_data.len() // "fmt " chunk data
-                    + 4 // "data" chunk tag
-                    + 4 // "data" chunk length value
-                    + stream.len() // "data" chunk data
-                ;
-                let riff_data_len_u32: u32 = riff_data_len.try_into().expect("wave data too long for 32 bits");
-
-                {
-                    let file_name = format!("{}stream.wav", filename_prefix);
-                    let f = File::create(&file_name)
-                        .expect("failed to open stream file");
-                    let mut writer = BufWriter::new(f);
-
-                    writer.write_all(b"RIFF").unwrap();
-                    writer.write_all(&riff_data_len_u32.to_le_bytes()).unwrap();
-                    writer.write_all(b"WAVE").unwrap();
-                    writer.write_all(b"fmt ").unwrap();
-                    writer.write_all(&u32::try_from(fmt_data.len()).unwrap().to_le_bytes()).unwrap();
-                    writer.write_all(&fmt_data).unwrap();
-                    writer.write_all(b"data").unwrap();
-                    writer.write_all(&u32::try_from(stream.len()).unwrap().to_le_bytes()).unwrap();
-                    writer.write_all(&stream).unwrap();
-                }
-            },
-            _ => {
-                let file_name = format!("{}stream.bin", filename_prefix);
-                let mut f = File::create(&file_name)
-                    .expect("failed to open stream file");
-                f.write_all(&stream)
-                    .expect("failed to write stream file");
-            },
+    if let Some(ssnd) = stream_sound {
+        if ssnd.data.len() > 0 {
+            let file_name = format!("{}stream.{}", filename_prefix, ssnd.extension());
+            let f = File::create(&file_name)
+                .expect("failed to open stream file");
+            ssnd.write(f)
+                .expect("failed to write stream file");
         }
     }
 }
