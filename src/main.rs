@@ -1,15 +1,18 @@
 mod adpcm;
+mod bitmap;
 mod shape;
 mod sound;
 
 
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Write, Read};
 use std::path::PathBuf;
 
 use clap::Parser;
-use swf::Tag;
+use swf::{BitmapFormat, Tag};
 
+use crate::bitmap::{Bitmap, BitmapData, RgbColor};
 use crate::shape::shape_to_svg;
 use crate::sound::Sound;
 
@@ -22,6 +25,7 @@ struct Opts {
 
 fn process_tags(filename_prefix: &str, tags: &[Tag]) {
     let mut stream_sound: Option<Sound> = None;
+    let mut id_to_bitmap: HashMap<u16, Bitmap> = HashMap::new();
     for tag in tags {
         match tag {
             Tag::DefineSound(snd) => {
@@ -50,9 +54,91 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             Tag::ExportAssets(ass) => {
                 println!("exporting assets: {:?}", ass);
             },
-            Tag::DefineBits { .. } => {},
-            Tag::DefineBitsJpeg2 { .. } => {},
-            Tag::DefineBitsLossless(_) => {},
+            Tag::DefineBits { id, jpeg_data } => {
+                id_to_bitmap.insert(
+                    *id,
+                    Bitmap::from_jpeg(jpeg_data, None),
+                );
+            },
+            Tag::DefineBitsJpeg2 { id, jpeg_data } => {
+                // Jpeg2 may also be PNG or GIF
+                id_to_bitmap.insert(
+                    *id,
+                    Bitmap::from_bytes(jpeg_data, None).unwrap(),
+                );
+            },
+            Tag::DefineBitsJpeg3(j3) => {
+                // Jpeg3 may also be PNG or GIF
+                let alpha_data = if j3.alpha_data.len() > 0 {
+                    Some(j3.alpha_data)
+                } else {
+                    None
+                };
+                id_to_bitmap.insert(
+                    j3.id,
+                    Bitmap::from_bytes(j3.data, alpha_data).unwrap(),
+                );
+            },
+            Tag::DefineBitsLossless(bmap) => {
+                // TODO: handle alpha if bmap.version == 2
+                match &bmap.format {
+                    BitmapFormat::ColorMap8 { num_colors } => {
+                        let actual_num_colors = usize::from(*num_colors) + 1;
+                        let mut palette_bytes = vec![0u8; 3*actual_num_colors];
+                        let mut image_data = Vec::new();
+                        let mut decoder = flate2::read::ZlibDecoder::new(bmap.data);
+                        decoder.read_exact(&mut palette_bytes)
+                            .expect("failed to read palette");
+                        decoder.read_to_end(&mut image_data)
+                            .expect("failed to read image data");
+
+                        let mut palette = Vec::with_capacity(actual_num_colors);
+                        let mut palette_iter = palette_bytes.iter();
+                        for _ in 0..actual_num_colors {
+                            let r = *palette_iter.next().unwrap();
+                            let g = *palette_iter.next().unwrap();
+                            let b = *palette_iter.next().unwrap();
+                            palette.push(RgbColor { r, g, b });
+                        }
+
+                        id_to_bitmap.insert(
+                            bmap.id,
+                            Bitmap::new(
+                                bmap.width.into(),
+                                bmap.height.into(),
+                                BitmapData::ColorMapped {
+                                    palette,
+                                    image_data,
+                                },
+                            )
+                        );
+                    },
+                    BitmapFormat::Rgb15 => {
+                        id_to_bitmap.insert(
+                            bmap.id,
+                            Bitmap::new(
+                                bmap.width.into(),
+                                bmap.height.into(),
+                                BitmapData::Rgb15 {
+                                    zlib_data: Vec::from(bmap.data),
+                                },
+                            )
+                        );
+                    },
+                    BitmapFormat::Rgb32 => {
+                        id_to_bitmap.insert(
+                            bmap.id,
+                            Bitmap::new(
+                                bmap.width.into(),
+                                bmap.height.into(),
+                                BitmapData::Rgb24 {
+                                    zlib_data: Vec::from(bmap.data),
+                                },
+                            )
+                        );
+                    },
+                }
+            },
             Tag::DefineButton2(_) => {},
             Tag::DefineButtonSound(_) => {},
             Tag::DefineEditText(et) => {
