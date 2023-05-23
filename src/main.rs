@@ -1,4 +1,5 @@
 mod adpcm;
+mod shape;
 mod sound;
 
 
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use swf::Tag;
 
+use crate::shape::shape_to_svg;
 use crate::sound::Sound;
 
 
@@ -53,12 +55,27 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             Tag::DefineBitsLossless(_) => {},
             Tag::DefineButton2(_) => {},
             Tag::DefineButtonSound(_) => {},
-            Tag::DefineEditText(_) => {},
+            Tag::DefineEditText(et) => {
+                if let Some(it) = et.initial_text {
+                    let filename = format!("{}{}.txt", filename_prefix, et.id);
+                    let mut f = File::create(&filename)
+                        .expect("failed to open text file");
+                    f.write_all(it.as_bytes())
+                        .expect("failed to write text file");
+                }
+            },
             Tag::DefineFont(_) => {},
             Tag::DefineFont2(_) => {},
             Tag::DefineFontInfo(_) => {},
             Tag::DefineMorphShape(_) => {},
-            Tag::DefineShape(_) => {},
+            Tag::DefineShape(sh) => {
+                let shape_data = shape_to_svg(sh);
+                let filename = format!("{}{}.svg", filename_prefix, sh.id);
+                let mut f = File::create(&filename)
+                    .expect("failed to open SVG file");
+                f.write_all(shape_data.as_bytes())
+                    .expect("failed to write SVG file");
+            },
             Tag::DefineText(_) => {},
             Tag::DoAction(_) => {},
             Tag::FrameLabel(_) => {},
