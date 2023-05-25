@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use swf::{BitmapFormat, Tag};
 
-use crate::bitmap::{Bitmap, BitmapData, RgbColor};
+use crate::bitmap::{Bitmap, BitmapData, RgbaColor, RgbColor};
 use crate::shape::shape_to_svg;
 use crate::sound::Sound;
 
@@ -26,6 +26,7 @@ struct Opts {
 fn process_tags(filename_prefix: &str, tags: &[Tag]) {
     let mut stream_sound: Option<Sound> = None;
     let mut id_to_bitmap: HashMap<u16, Bitmap> = HashMap::new();
+    let mut jpeg_tables = Vec::new();
     for tag in tags {
         match tag {
             Tag::DefineSound(snd) => {
@@ -55,19 +56,24 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
                 println!("exporting assets: {:?}", ass);
             },
             Tag::DefineBits { id, jpeg_data } => {
+                println!("Bits {}", id);
                 id_to_bitmap.insert(
                     *id,
-                    Bitmap::from_jpeg(jpeg_data, None),
+                    Bitmap::from_jpeg(jpeg_data, &jpeg_tables, None).unwrap(),
                 );
             },
             Tag::DefineBitsJpeg2 { id, jpeg_data } => {
+                println!("J2 {}", id);
                 // Jpeg2 may also be PNG or GIF
-                id_to_bitmap.insert(
-                    *id,
-                    Bitmap::from_bytes(jpeg_data, None).unwrap(),
-                );
+                if let Some(bmp) = Bitmap::from_bytes(jpeg_data, None) {
+                    id_to_bitmap.insert(
+                        *id,
+                        bmp,
+                    );
+                }
             },
             Tag::DefineBitsJpeg3(j3) => {
+                println!("J3 {}", j3.id);
                 // Jpeg3 may also be PNG or GIF
                 let alpha_data = if j3.alpha_data.len() > 0 {
                     Some(j3.alpha_data)
@@ -80,25 +86,117 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
                 );
             },
             Tag::DefineBitsLossless(bmap) => {
-                // TODO: handle alpha if bmap.version == 2
                 match &bmap.format {
                     BitmapFormat::ColorMap8 { num_colors } => {
                         let actual_num_colors = usize::from(*num_colors) + 1;
-                        let mut palette_bytes = vec![0u8; 3*actual_num_colors];
-                        let mut image_data = Vec::new();
+                        let component_count = if bmap.version == 2 { 4 } else { 3 };
+                        let mut palette_bytes = vec![0u8; component_count*actual_num_colors];
+                        let mut image_data_padded = Vec::new();
                         let mut decoder = flate2::read::ZlibDecoder::new(bmap.data);
                         decoder.read_exact(&mut palette_bytes)
                             .expect("failed to read palette");
-                        decoder.read_to_end(&mut image_data)
+                        decoder.read_to_end(&mut image_data_padded)
                             .expect("failed to read image data");
 
-                        let mut palette = Vec::with_capacity(actual_num_colors);
-                        let mut palette_iter = palette_bytes.iter();
-                        for _ in 0..actual_num_colors {
-                            let r = *palette_iter.next().unwrap();
-                            let g = *palette_iter.next().unwrap();
-                            let b = *palette_iter.next().unwrap();
-                            palette.push(RgbColor { r, g, b });
+                        let data = if bmap.version == 2 {
+                            let mut palette = Vec::with_capacity(actual_num_colors);
+                            let mut palette_iter = palette_bytes.iter();
+                            for _ in 0..actual_num_colors {
+                                let r = *palette_iter.next().unwrap();
+                                let g = *palette_iter.next().unwrap();
+                                let b = *palette_iter.next().unwrap();
+                                let a = *palette_iter.next().unwrap();
+                                palette.push(RgbaColor { r, g, b, a });
+                            }
+
+                            let mut image_data = Vec::with_capacity(image_data_padded.len());
+                            let mut data_iter = image_data_padded.iter();
+                            for _ in 0..bmap.height {
+                                for _ in 0..bmap.width {
+                                    let pixel = *data_iter.next().unwrap();
+                                    image_data.push(pixel);
+                                }
+
+                                // 1 byte per pixel, padded to 4 bytes
+                                if (1 * bmap.width) % 4 != 0 {
+                                    let padding_count = 4 - ((1 * bmap.width) % 4);
+                                    for _ in 0..padding_count {
+                                        data_iter.next().unwrap();
+                                    }
+                                }
+                            }
+
+                            BitmapData::ColorMappedAlpha {
+                                palette,
+                                image_data,
+                            }
+                        } else {
+                            let mut palette = Vec::with_capacity(actual_num_colors);
+                            let mut palette_iter = palette_bytes.iter();
+                            for _ in 0..actual_num_colors {
+                                let r = *palette_iter.next().unwrap();
+                                let g = *palette_iter.next().unwrap();
+                                let b = *palette_iter.next().unwrap();
+                                palette.push(RgbColor { r, g, b });
+                            }
+
+                            let mut image_data = Vec::with_capacity(image_data_padded.len());
+                            let mut data_iter = image_data_padded.iter();
+                            for _ in 0..bmap.height {
+                                for _ in 0..bmap.width {
+                                    let pixel = *data_iter.next().unwrap();
+                                    image_data.push(pixel);
+                                }
+
+                                // 1 byte per pixel, padded to 4 bytes
+                                if (1 * bmap.width) % 4 != 0 {
+                                    let padding_count = 4 - ((1 * bmap.width) % 4);
+                                    for _ in 0..padding_count {
+                                        data_iter.next().unwrap();
+                                    }
+                                }
+                            }
+
+                            BitmapData::ColorMapped {
+                                palette,
+                                image_data,
+                            }
+                        };
+
+                        id_to_bitmap.insert(
+                            bmap.id,
+                            Bitmap::new(
+                                bmap.width.into(),
+                                bmap.height.into(),
+                                data,
+                            )
+                        );
+                    },
+                    BitmapFormat::Rgb15 => {
+                        if bmap.version == 2 {
+                            panic!("forbidden combo of version 2 with format Rgb15");
+                        }
+
+                        let mut image_data_padded = Vec::new();
+                        let mut decoder = flate2::read::ZlibDecoder::new(bmap.data);
+                        decoder.read_to_end(&mut image_data_padded)
+                            .expect("failed to read image data");
+
+                        let mut image_data = Vec::with_capacity(image_data_padded.len());
+                        let mut data_iter = image_data_padded.iter();
+                        for _ in 0..bmap.height {
+                            for _ in 0..bmap.width {
+                                let pixel = *data_iter.next().unwrap();
+                                image_data.push(pixel);
+                            }
+
+                            // 2 bytes per pixel, padded to 4 bytes
+                            if (2 * bmap.width) % 4 != 0 {
+                                let padding_count = 4 - ((2 * bmap.width) % 4);
+                                for _ in 0..padding_count {
+                                    data_iter.next().unwrap();
+                                }
+                            }
                         }
 
                         id_to_bitmap.insert(
@@ -106,34 +204,57 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
                             Bitmap::new(
                                 bmap.width.into(),
                                 bmap.height.into(),
-                                BitmapData::ColorMapped {
-                                    palette,
+                                BitmapData::Rgb15 {
                                     image_data,
                                 },
                             )
                         );
                     },
-                    BitmapFormat::Rgb15 => {
-                        id_to_bitmap.insert(
-                            bmap.id,
-                            Bitmap::new(
-                                bmap.width.into(),
-                                bmap.height.into(),
-                                BitmapData::Rgb15 {
-                                    zlib_data: Vec::from(bmap.data),
-                                },
-                            )
-                        );
-                    },
                     BitmapFormat::Rgb32 => {
+                        let data = if bmap.version == 2 {
+                            // 4 bytes per pixel => no padding
+
+                            let mut image_data = Vec::new();
+                            let mut decoder = flate2::read::ZlibDecoder::new(bmap.data);
+                            decoder.read_to_end(&mut image_data)
+                                .expect("failed to read image data");
+
+                            BitmapData::Rgba32 {
+                                image_data,
+                            }
+                        } else {
+                            let mut image_data_padded = Vec::new();
+                            let mut decoder = flate2::read::ZlibDecoder::new(bmap.data);
+                            decoder.read_to_end(&mut image_data_padded)
+                                .expect("failed to read image data");
+
+                            let mut image_data = Vec::with_capacity(image_data_padded.len());
+                            let mut data_iter = image_data_padded.iter();
+                            for _ in 0..bmap.height {
+                                for _ in 0..bmap.width {
+                                    let pixel = *data_iter.next().unwrap();
+                                    image_data.push(pixel);
+                                }
+
+                                // 3 bytes per pixel, padded to 4 bytes
+                                if (3 * bmap.width) % 4 != 0 {
+                                    let padding_count = 4 - ((3 * bmap.width) % 4);
+                                    for _ in 0..padding_count {
+                                        data_iter.next().unwrap();
+                                    }
+                                }
+                            }
+
+                            BitmapData::Rgb24 {
+                                image_data,
+                            }
+                        };
                         id_to_bitmap.insert(
                             bmap.id,
                             Bitmap::new(
                                 bmap.width.into(),
                                 bmap.height.into(),
-                                BitmapData::Rgb24 {
-                                    zlib_data: Vec::from(bmap.data),
-                                },
+                                data,
                             )
                         );
                     },
@@ -165,7 +286,13 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             Tag::DefineText(_) => {},
             Tag::DoAction(_) => {},
             Tag::FrameLabel(_) => {},
-            Tag::JpegTables(_) => {},
+            Tag::JpegTables(jt) => {
+                if let Some(jt_no_prefix) = jt.strip_prefix(&[0xFF, 0xD8]) {
+                    if let Some(jt_stripped) = jt_no_prefix.strip_suffix(&[0xFF, 0xD9]) {
+                        jpeg_tables = Vec::from(jt_stripped);
+                    }
+                }
+            },
             Tag::PlaceObject(_) => {},
             Tag::Protect(_) => {},
             Tag::RemoveObject(_) => {},
@@ -202,6 +329,13 @@ fn process_tags(filename_prefix: &str, tags: &[Tag]) {
             ssnd.write(f)
                 .expect("failed to write stream file");
         }
+    }
+    for (i, bitmap) in &id_to_bitmap {
+        let file_name = format!("{}{}.{}", filename_prefix, i, bitmap.extension());
+        let f = File::create(&file_name)
+            .expect("failed to open bitmap file");
+        bitmap.write(f)
+            .expect("failed to write bitmap file");
     }
 }
 

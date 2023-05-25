@@ -18,6 +18,13 @@ pub(crate) struct RgbColor {
     pub b: u8,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RgbaColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -109,8 +116,10 @@ impl Bitmap {
             },
             BitmapData::Png { .. } => "png",
             BitmapData::ColorMapped { .. } => "png",
+            BitmapData::ColorMappedAlpha { .. } => "png",
             BitmapData::Rgb15 { .. } => "png",
             BitmapData::Rgb24 { .. } => "png",
+            BitmapData::Rgba32 { .. } => "png",
         }
     }
 
@@ -238,14 +247,29 @@ impl Bitmap {
                 let mut writer = png.write_header()?;
                 writer.write_image_data(&image_data)?;
             },
-            BitmapData::Rgb15 { zlib_data } => {
-                let mut image_data = Vec::new();
-                {
-                    let mut decoder = flate2::read::ZlibDecoder::new(zlib_data.as_slice());
-                    decoder.read_to_end(&mut image_data)
-                        .map_err(|e| Error::ZlibDecoding(e))?;
+            BitmapData::ColorMappedAlpha { palette, image_data } => {
+                let mut palette_bytes = Vec::with_capacity(3*palette.len());
+                let mut transparency_bytes = Vec::with_capacity(palette.len());
+                for color in palette {
+                    palette_bytes.push(color.r);
+                    palette_bytes.push(color.g);
+                    palette_bytes.push(color.b);
+                    transparency_bytes.push(color.a);
                 }
 
+                let mut png = png::Encoder::new(
+                    write,
+                    self.width,
+                    self.height,
+                );
+                png.set_color(ColorType::Indexed);
+                png.set_depth(BitDepth::Eight);
+                png.set_palette(&palette_bytes);
+                png.set_trns(&transparency_bytes);
+                let mut writer = png.write_header()?;
+                writer.write_image_data(&image_data)?;
+            },
+            BitmapData::Rgb15 { image_data } => {
                 let mut data_iter = image_data.iter();
 
                 let mut png = png::Encoder::new(
@@ -277,14 +301,7 @@ impl Bitmap {
                     writer.write_image_data(&row)?;
                 }
             },
-            BitmapData::Rgb24 { zlib_data } => {
-                let mut image_data = Vec::new();
-                {
-                    let mut decoder = flate2::read::ZlibDecoder::new(zlib_data.as_slice());
-                    decoder.read_to_end(&mut image_data)
-                        .map_err(|e| Error::ZlibDecoding(e))?;
-                }
-
+            BitmapData::Rgb24 { image_data } => {
                 let mut data_iter = image_data.iter();
 
                 let mut png = png::Encoder::new(
@@ -308,6 +325,37 @@ impl Bitmap {
                         row.push(*r);
                         row.push(*g);
                         row.push(*b);
+                    }
+                    writer.write_image_data(&row)?;
+                }
+            },
+            BitmapData::Rgba32 { image_data } => {
+                let mut data_iter = image_data.iter();
+
+                let mut png = png::Encoder::new(
+                    write,
+                    self.width,
+                    self.height,
+                );
+                png.set_color(ColorType::Rgba);
+                png.set_depth(BitDepth::Eight);
+                let mut writer = png.write_header()?;
+                let mut row = Vec::new();
+                for _ in 0..self.height {
+                    row.clear();
+                    for _ in 0..self.width {
+                        let r = data_iter.next()
+                            .ok_or(Error::ShortRead)?;
+                        let g = data_iter.next()
+                            .ok_or(Error::ShortRead)?;
+                        let b = data_iter.next()
+                            .ok_or(Error::ShortRead)?;
+                        let a = data_iter.next()
+                            .ok_or(Error::ShortRead)?;
+                        row.push(*r);
+                        row.push(*g);
+                        row.push(*b);
+                        row.push(*a);
                     }
                     writer.write_image_data(&row)?;
                 }
@@ -343,28 +391,44 @@ impl Bitmap {
         ))
     }
 
-    pub fn from_jpeg(jpeg_data: &[u8], alpha_data: Option<&[u8]>) -> Self {
-        let decoder = jpeg_decoder::Decoder::new(jpeg_data);
+    pub fn from_jpeg(jpeg_data: &[u8], jpeg_tables: &[u8], alpha_data: Option<&[u8]>) -> Result<Self, Error> {
+        let mut full_jpeg_data;
+        let actual_jpeg_data = if jpeg_tables.len() > 0 {
+            full_jpeg_data = Vec::with_capacity(jpeg_data.len() + jpeg_tables.len());
+            let sos_location = jpeg_data
+                .windows(2)
+                .position(|window| window == &[0xFF, 0xDA])
+                .expect("no SOS in JPEG data");
+            full_jpeg_data.extend(&jpeg_data[0..sos_location]);
+            full_jpeg_data.extend(jpeg_tables);
+            full_jpeg_data.extend(&jpeg_data[sos_location..]);
+            full_jpeg_data.as_slice()
+        } else {
+            jpeg_data
+        };
+
+        let mut decoder = jpeg_decoder::Decoder::new(actual_jpeg_data);
+        decoder.read_info()?;
         let image_info = decoder.info().unwrap();
         let width = image_info.width.into();
         let height = image_info.height.into();
-        Self::new(
+        Ok(Self::new(
             width,
             height,
             BitmapData::Jpeg {
-                jpeg_data: Vec::from(jpeg_data),
+                jpeg_data: Vec::from(actual_jpeg_data),
                 alpha_data: alpha_data.map(|ad| Vec::from(ad)),
             },
-        )
+        ))
     }
 
     pub fn from_bytes(bytes: &[u8], alpha_bytes: Option<&[u8]>) -> Option<Self> {
         if bytes.starts_with(GIF_MAGIC) {
-            Some(Bitmap::from_gif(bytes).ok()?)
+            Bitmap::from_gif(bytes).ok()
         } else if bytes.starts_with(PNG_MAGIC) {
-            Some(Bitmap::from_png(bytes).ok()?)
+            Bitmap::from_png(bytes).ok()
         } else if bytes.starts_with(JPEG_MAGIC) {
-            Some(Bitmap::from_jpeg(bytes, alpha_bytes))
+            Bitmap::from_jpeg(bytes, &[], alpha_bytes).ok()
         } else {
             None
         }
@@ -384,8 +448,13 @@ pub(crate) enum BitmapData {
         palette: Vec<RgbColor>,
         image_data: Vec<u8>,
     },
-    Rgb15 { zlib_data: Vec<u8> },
-    Rgb24 { zlib_data: Vec<u8> },
+    ColorMappedAlpha {
+        palette: Vec<RgbaColor>,
+        image_data: Vec<u8>,
+    },
+    Rgb15 { image_data: Vec<u8> },
+    Rgb24 { image_data: Vec<u8> },
+    Rgba32 { image_data: Vec<u8> },
 }
 impl BitmapData {
     pub fn is_gif(&self) -> bool {
